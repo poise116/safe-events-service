@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cache } from 'cache-manager';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -42,7 +42,9 @@ export class WebhookDispatcherService {
   }
 
   /**
-   * Load at startup nestjs app
+   * Initializes the service by loading active webhooks from the database into memory.
+   * This ensures that the service is ready to dispatch events upon startup.
+   * Load at startup nestjs app.
    */
   async onModuleInit() {
     this.logger.log({
@@ -52,16 +54,21 @@ export class WebhookDispatcherService {
   }
 
   /**
-   * @returns Return active webhooks from database
+   * Retrieves all active webhooks from the database.
+   *
+   * @returns {Promise<Webhook[]>} A promise that resolves to an array of active webhooks.
    */
   getAllActive(): Promise<Webhook[]> {
     return this.WebHooksRepository.findBy({ isActive: true });
   }
 
   /**
-   * Disable the webhook in database by the provided id
-   * @param id webhook unique identifier
-   * @returns true if was correctly disabled, false otherwise.
+   * Disables a webhook by its ID.
+   *
+   * @param {string} id - The unique identifier of the webhook to disable.
+   * @returns {Promise<boolean>} A promise that resolves to true if the webhook was successfully disabled.
+   * @throws {NotFoundException} If the webhook with the given ID is not found.
+   * @throws {Error} If there is any other error during the database update.
    */
   async disableWebhook(id: string): Promise<boolean> {
     try {
@@ -71,28 +78,31 @@ export class WebhookDispatcherService {
       );
 
       if (result.affected === 0) {
-        this.logger.error({
-          message: `Webhook with ID ${id} not found or already inactive.`,
-        });
-        return false;
+        this.logger.warn(`Webhook with ID ${id} not found or already inactive.`);
+        throw new NotFoundException(`Webhook with ID ${id} not found or already inactive.`);
       }
       return true;
     } catch (error) {
-      this.logger.error({
-        message: `Failed to disable webhook with ID ${id}: ${error.message}`,
-      });
-      return false;
+      this.logger.error(`Failed to disable webhook with ID ${id}.`, error.stack);
+      throw error;
     }
   }
 
   /**
+   * Returns the in-memory list of active webhooks with their statistics.
    *
-   * @returns a list of in memory stored webhooks
+   * @returns {WebhookWithStats[]} An array of active webhooks with statistics.
    */
   getCachedActiveWebhooks(): WebhookWithStats[] {
     return Array.from(this.webhookMap.values());
   }
 
+  /**
+   * Iterates through all active webhooks and posts the event to the relevant ones.
+   *
+   * @param {TxServiceEvent} parsedMessage - The event to be dispatched.
+   * @returns {Promise<(AxiosResponse | undefined)[]>} A promise that resolves to an array of Axios responses or undefined for failed requests.
+   */
   async postEveryWebhook(
     parsedMessage: TxServiceEvent,
   ): Promise<(AxiosResponse | undefined)[]> {
@@ -110,6 +120,12 @@ export class WebhookDispatcherService {
     return Promise.all(responses);
   }
 
+  /**
+   * Safely stringifies response data for logging purposes.
+   *
+   * @param {*} responseData - The data to be stringified.
+   * @returns {string} The stringified data or an error message if parsing fails.
+   */
   parseResponseData(responseData: any): string {
     if (typeof responseData === 'string') {
       return responseData;
@@ -123,6 +139,13 @@ export class WebhookDispatcherService {
     return dataStr;
   }
 
+  /**
+   * Sends a single event to a specific webhook URL.
+   *
+   * @param {TxServiceEvent} parsedMessage - The event to be sent.
+   * @param {WebhookWithStats} webhook - The webhook to which the event will be sent.
+   * @returns {Promise<AxiosResponse | undefined>} A promise that resolves to the Axios response or undefined if the request fails.
+   */
   postWebhook(
     parsedMessage: TxServiceEvent,
     webhook: WebhookWithStats,
@@ -254,10 +277,9 @@ export class WebhookDispatcherService {
   }
 
   /**
-   * Refreshes the internal map of active webhooks.
-   * This method is crucial for ensuring that the webhook map is always in sync with the current state of the active webhooks
-   * in the database, while maintaining webhook health stats and status.
-   * @throws {Error} - Throws an error if there's an issue retrieving or processing the webhooks from the database.
+   * Periodically refreshes the in-memory webhook map from the database.
+   * This method runs as a cron job every minute and ensures that the webhook map is always in sync
+   * with the current state of the active webhooks in the database, while maintaining webhook health stats and status.
    */
   @Cron('* * * * *') // Run every minute
   async refreshWebhookMap() {
